@@ -1383,7 +1383,7 @@ wrapFsFunc("rename", [0, 1]);
 if (process.platform === "win32") {
   var rename = files.rename;
 
-  files.rename = function (from, to) {
+  function rename_win_old_(from, to) {
     // retries are necessarily only on Windows, because the rename call can fail
     // with EBUSY, which means the file is "busy"
     var maxTries = 10;
@@ -1400,6 +1400,83 @@ if (process.platform === "win32") {
     if (! success) {
       files.cp_r(from, to);
       files.rm_recursive(from);
+    }
+  }
+
+  // context: optional object that is provided as `this` to selectors, any errors that
+  //    are caught will be put into `context.errors` pushable
+  //    default: empty object
+  // attemptStrategySelector: function that returns the next task to execute the task
+  //    should be a callable function;
+  //    falsy return values are considered a signal to give up retrying and throw error;
+  //    `context` will be passed as its `this`;
+  //    default: none, mandatory param
+  // delaySelector: function that returns how long to wait before next attempt in ms;
+  //    return values not greater than zero are considered "don't wait at all" signal;
+  //    `context` will be passed as its `this`;
+  //    default: 100ms * number of retries
+  // errorSelector: function that returns the error to be actually thrown when the
+  //    algorithm gives up trying;
+  //    `context` will be passed as its `this`;
+  //    default: first error (the original one from before retries)
+  function retryWithDelayAndFallbacks(attemptStrategySelector, delaySelector, errorSelector, context) {
+
+    var ctx = context || { };
+    ctx.errors = ctx.errors || [];
+    var stratSel = attemptStrategySelector;
+    var delaySel = delaySelector || function delay100msPerRetry(errarr) { return this.errors.length * 100; };
+    var errorSel = errorSelector || function takeFirstError(errarr) { return (this.errors[this.errors.length-1].code !== "EPERM") ? this.errors[this.errors.length-1] : this.errors[0]; };
+
+    if(!stratSel)
+      throw new Error('StrategySelector as not provided');
+
+    var args = [ctx];
+    var task;
+    while(task = stratSel.apply(ctx))
+      try {
+        var time = delaySel.apply(ctx);
+        if(time > 0)
+          utils.sleepMs(time);
+
+        return task.apply(ctx);
+
+      } catch (err) {
+        ctx.errors.push(err);
+      }
+    
+    throw errorSel.apply(ctx);
+  }
+
+  function rename_win_new_(from, to, options) {
+    return retryWithDelayAndFallbacks(function(){
+      if(this.errors.length > 0 && this.errors[this.errors.length-1].code !== "EPERM"){
+        return null;
+      }
+
+      else if(this.errors.length > options.maxBusyTries){
+        return null;
+      }
+
+      else if(this.errors.length < options.cprThreshold)
+        return function basicRename() {
+          rename(from, to);
+        };
+    
+      else
+        return function cprRmrFallback() {
+          files.cp_r(from, to);
+          files.rm_recursive(from);
+        };
+    });
+  }
+
+  files.rename = function (from, to) {
+    if (Fiber.current && Fiber.yield && ! Fiber.yield.disallowed) {
+      var f = rename_win_new_.future();
+      var fut = f(from, to, { maxBusyTries: 10, cprThreshold: 5 });
+      fut.wait();
+    } else {
+      rename_win_old_(from, to);
     }
   };
 }
